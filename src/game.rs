@@ -7,8 +7,6 @@ use macroquad::prelude::*;
 use macroquad::rand::gen_range;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
-#[cfg(target_arch = "wasm32")]
-use web_sys::window;
 
 const CURSOR_SPEED: f32 = 720.0;
 const ENEMY_BLAST_RADIUS: f32 = 24.0;
@@ -2217,9 +2215,16 @@ fn store_save_data(save: SaveData) {
 
 #[cfg(target_arch = "wasm32")]
 fn load_save_blob() -> Option<String> {
-    window()
-        .and_then(|window| window.local_storage().ok().flatten())
-        .and_then(|storage| storage.get_item("mcommand.save").ok().flatten())
+    let len = unsafe { mcommand_storage_get_len() };
+    if len <= 0 {
+        return None;
+    }
+
+    let mut buffer = vec![0u8; len as usize];
+    unsafe {
+        mcommand_storage_get(buffer.as_mut_ptr(), len as u32);
+    }
+    String::from_utf8(buffer).ok()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2229,8 +2234,8 @@ fn load_save_blob() -> Option<String> {
 
 #[cfg(target_arch = "wasm32")]
 fn store_save_blob(raw: &str) {
-    if let Some(storage) = window().and_then(|window| window.local_storage().ok().flatten()) {
-        let _ = storage.set_item("mcommand.save", raw);
+    unsafe {
+        mcommand_storage_set(raw.as_ptr(), raw.len() as u32);
     }
 }
 
@@ -2247,6 +2252,13 @@ fn native_save_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."));
     path.push(".mcommand-save");
     path
+}
+
+#[cfg(target_arch = "wasm32")]
+unsafe extern "C" {
+    fn mcommand_storage_get_len() -> i32;
+    fn mcommand_storage_get(ptr: *mut u8, len: u32);
+    fn mcommand_storage_set(ptr: *const u8, len: u32);
 }
 
 enum Waveform {
