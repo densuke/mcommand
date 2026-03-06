@@ -220,8 +220,14 @@ struct TargetSlot {
 #[derive(Clone, Copy)]
 enum EnemyKind {
     Basic,
-    Splitter { split_progress: f32 },
-    SmartBomb { dodges_left: u8, cooldown: f32 },
+    Splitter {
+        split_progress: f32,
+    },
+    SmartBomb {
+        dodges_left: u8,
+        cooldown: f32,
+        weave_phase: f32,
+    },
 }
 
 struct PlayerMissile {
@@ -239,6 +245,20 @@ struct EnemyMissile {
     speed: f32,
     kind: EnemyKind,
     color: Color,
+}
+
+struct Bomber {
+    position: Vec2,
+    velocity: Vec2,
+    drop_timer: f32,
+    wobble: f32,
+}
+
+struct Satellite {
+    position: Vec2,
+    velocity: Vec2,
+    drop_timer: f32,
+    phase: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -356,6 +376,8 @@ pub struct Game {
     cities: [City; 6],
     player_missiles: Vec<PlayerMissile>,
     enemy_missiles: Vec<EnemyMissile>,
+    bombers: Vec<Bomber>,
+    satellites: Vec<Satellite>,
     explosions: Vec<Explosion>,
     score: u32,
     next_city_restore_score: u32,
@@ -365,6 +387,8 @@ pub struct Game {
     spawn_timer: f32,
     intermission_timer: f32,
     wave_banner_timer: f32,
+    bomber_spawned_in_wave: bool,
+    satellite_spawned_in_wave: bool,
     paused: bool,
 }
 
@@ -393,6 +417,8 @@ impl Game {
             }; 6],
             player_missiles: Vec::new(),
             enemy_missiles: Vec::new(),
+            bombers: Vec::new(),
+            satellites: Vec::new(),
             explosions: Vec::new(),
             score: 0,
             next_city_restore_score: CITY_RESTORE_STEP,
@@ -402,6 +428,8 @@ impl Game {
             spawn_timer: 0.0,
             intermission_timer: 0.0,
             wave_banner_timer: 0.0,
+            bomber_spawned_in_wave: false,
+            satellite_spawned_in_wave: false,
             paused: false,
         };
         game.populate_defense_line();
@@ -432,6 +460,8 @@ impl Game {
         self.draw_stars();
 
         if matches!(self.mode, ScreenState::Playing | ScreenState::GameOver) {
+            self.draw_satellites();
+            self.draw_bombers();
             self.draw_enemy_missiles();
             self.draw_player_missiles();
             self.draw_explosions();
@@ -556,12 +586,17 @@ impl Game {
 
         self.update_player_missiles(dt);
         self.update_enemy_missiles(dt);
+        self.update_bombers(dt);
+        self.update_satellites(dt);
         self.update_explosions(dt);
         self.handle_explosion_hits();
+        self.handle_airborne_hits();
         self.update_wave_spawning(dt);
 
         if self.enemies_spawned == self.enemies_to_spawn
             && self.enemy_missiles.is_empty()
+            && self.bombers.is_empty()
+            && self.satellites.is_empty()
             && self.intermission_timer <= 0.0
         {
             self.finish_wave();
@@ -577,6 +612,8 @@ impl Game {
         self.wave = 1;
         self.player_missiles.clear();
         self.enemy_missiles.clear();
+        self.bombers.clear();
+        self.satellites.clear();
         self.explosions.clear();
 
         for (index, base) in self.bases.iter_mut().enumerate() {
@@ -618,8 +655,12 @@ impl Game {
         self.spawn_timer = 1.0;
         self.intermission_timer = 0.0;
         self.wave_banner_timer = 1.75;
+        self.bomber_spawned_in_wave = false;
+        self.satellite_spawned_in_wave = false;
         self.player_missiles.clear();
         self.enemy_missiles.clear();
+        self.bombers.clear();
+        self.satellites.clear();
         self.explosions.clear();
 
         for base in &mut self.bases {
@@ -781,39 +822,49 @@ impl Game {
             .map(|explosion| (explosion.position, explosion.radius))
             .collect();
         let mut smart_dodge_triggered = false;
+        let layout = self.layout;
 
         self.enemy_missiles.retain_mut(|missile| {
             if let EnemyKind::SmartBomb {
                 dodges_left,
                 cooldown,
+                weave_phase,
             } = &mut missile.kind
             {
                 *cooldown = (*cooldown - dt).max(0.0);
+                *weave_phase += dt * 7.5;
+                let smart_course = (missile.target - missile.position).normalize_or_zero();
+                let mut smart_side = vec2(-smart_course.y, smart_course.x);
+                if smart_side.length_squared() == 0.0 {
+                    smart_side = vec2(1.0, 0.0);
+                }
+                missile.position += smart_side.normalize() * weave_phase.sin() * 34.0 * dt;
+                missile.position.x = missile.position.x.clamp(28.0, layout.screen.x - 28.0);
+                missile.position.y = missile
+                    .position
+                    .y
+                    .clamp(layout.horizon_y, layout.ground_y - 86.0);
+
                 if *dodges_left > 0 && *cooldown <= 0.0 {
                     if let Some((blast_pos, blast_radius)) =
                         nearest_blast(missile.position, &player_blasts)
                     {
                         if missile.position.distance(blast_pos) <= blast_radius + 34.0 {
-                            let course = (missile.target - missile.position).normalize_or_zero();
-                            let mut side = vec2(-course.y, course.x);
-                            if side.length_squared() == 0.0 {
-                                side = vec2(1.0, 0.0);
-                            }
-                            let sign = if side.dot(blast_pos - missile.position) > 0.0 {
+                            let sign = if smart_side.dot(blast_pos - missile.position) > 0.0 {
                                 -1.0
                             } else {
                                 1.0
                             };
-                            missile.position += side.normalize() * sign * 42.0;
+                            missile.position += smart_side.normalize() * sign * 190.0 * dt;
                             missile.position.x =
-                                missile.position.x.clamp(28.0, self.layout.screen.x - 28.0);
+                                missile.position.x.clamp(28.0, layout.screen.x - 28.0);
                             missile.position.y = missile
                                 .position
                                 .y
-                                .clamp(self.layout.horizon_y, self.layout.ground_y - 86.0);
+                                .clamp(layout.horizon_y, layout.ground_y - 86.0);
                             missile.start = missile.position;
                             *dodges_left -= 1;
-                            *cooldown = 0.34;
+                            *cooldown = 0.22;
                             smart_dodge_triggered = true;
                         }
                     }
@@ -884,6 +935,57 @@ impl Game {
         }
     }
 
+    fn update_bombers(&mut self, dt: f32) {
+        let mut drops = Vec::new();
+        self.bombers.retain_mut(|bomber| {
+            bomber.wobble += dt * 2.8;
+            bomber.position += bomber.velocity * dt;
+            bomber.position.y += bomber.wobble.sin() * 10.0 * dt;
+            bomber.drop_timer -= dt;
+
+            let on_screen =
+                bomber.position.x >= -90.0 && bomber.position.x <= self.layout.screen.x + 90.0;
+            if on_screen && bomber.drop_timer <= 0.0 {
+                drops.push(bomber.position);
+                bomber.drop_timer = gen_range(0.8, 1.35);
+            }
+
+            bomber.position.x >= -140.0 && bomber.position.x <= self.layout.screen.x + 140.0
+        });
+
+        for drop in drops {
+            self.spawn_air_dropped_missile(drop, 1.08, 0.0, 0.15);
+        }
+    }
+
+    fn update_satellites(&mut self, dt: f32) {
+        let mut drops = Vec::new();
+        self.satellites.retain_mut(|satellite| {
+            satellite.phase += dt * 4.2;
+            satellite.position += satellite.velocity * dt;
+            satellite.position.y += satellite.phase.sin() * 6.0 * dt;
+            satellite.drop_timer -= dt;
+
+            let on_screen = satellite.position.x >= -50.0
+                && satellite.position.x <= self.layout.screen.x + 50.0;
+            if on_screen && satellite.drop_timer <= 0.0 {
+                drops.push(satellite.position);
+                satellite.drop_timer = gen_range(0.55, 0.95);
+            }
+
+            satellite.position.x >= -100.0 && satellite.position.x <= self.layout.screen.x + 100.0
+        });
+
+        for drop in drops {
+            self.spawn_air_dropped_missile(
+                drop,
+                1.18,
+                self.config.difficulty.smart_bomb_chance() * 0.8 + 0.08,
+                0.0,
+            );
+        }
+    }
+
     fn update_explosions(&mut self, dt: f32) {
         self.explosions.retain_mut(|explosion| {
             if explosion.expanding {
@@ -933,8 +1035,74 @@ impl Game {
         self.explosions.extend(detonations);
     }
 
+    fn handle_airborne_hits(&mut self) {
+        let blast_fields: Vec<(Vec2, f32)> = self
+            .explosions
+            .iter()
+            .filter(|explosion| matches!(explosion.owner, ExplosionOwner::Player))
+            .map(|explosion| (explosion.position, explosion.radius))
+            .collect();
+
+        let mut score = 0u32;
+        let mut detonations = Vec::new();
+        let mut smart_sound = false;
+
+        self.bombers.retain(|bomber| {
+            let hit = blast_fields
+                .iter()
+                .any(|(position, radius)| bomber.position.distance(*position) <= *radius + 24.0);
+            if hit {
+                score += 125;
+                detonations.push(Explosion {
+                    position: bomber.position,
+                    radius: 10.0,
+                    max_radius: 26.0,
+                    expand_speed: 180.0,
+                    contract_speed: 110.0,
+                    expanding: true,
+                    owner: ExplosionOwner::Enemy,
+                });
+                false
+            } else {
+                true
+            }
+        });
+
+        self.satellites.retain(|satellite| {
+            let hit = blast_fields
+                .iter()
+                .any(|(position, radius)| satellite.position.distance(*position) <= *radius + 16.0);
+            if hit {
+                score += 175;
+                smart_sound = true;
+                detonations.push(Explosion {
+                    position: satellite.position,
+                    radius: 8.0,
+                    max_radius: 20.0,
+                    expand_speed: 210.0,
+                    contract_speed: 120.0,
+                    expanding: true,
+                    owner: ExplosionOwner::Enemy,
+                });
+                false
+            } else {
+                true
+            }
+        });
+
+        if score > 0 {
+            self.award_points(score);
+            self.audio.play_explosion();
+        }
+        if smart_sound {
+            self.audio.play_smart_bomb();
+        }
+        self.explosions.extend(detonations);
+    }
+
     fn update_wave_spawning(&mut self, dt: f32) {
         if self.enemies_spawned >= self.enemies_to_spawn {
+            self.maybe_spawn_air_support();
             return;
         }
 
@@ -944,6 +1112,7 @@ impl Game {
             self.enemies_spawned += 1;
             self.spawn_timer += self.next_spawn_interval();
         }
+        self.maybe_spawn_air_support();
     }
 
     fn spawn_enemy_missile(&mut self) {
@@ -956,7 +1125,6 @@ impl Game {
             gen_range(48.0, self.layout.screen.x - 48.0),
             self.layout.horizon_y,
         );
-        let target = self.target_position(target_slot);
         let base_speed =
             (74.0 + self.wave as f32 * 9.0) * self.config.difficulty.enemy_speed_factor();
         let smart_bombs_allowed = self.wave >= self.config.difficulty.smart_bomb_start_wave();
@@ -965,6 +1133,7 @@ impl Game {
             EnemyKind::SmartBomb {
                 dodges_left: 3,
                 cooldown: 0.0,
+                weave_phase: gen_range(0.0, PI * 2.0),
             }
         } else if self.wave >= 3 && roll < 0.22 + self.config.difficulty.smart_bomb_chance() * 0.4 {
             EnemyKind::Splitter {
@@ -973,7 +1142,101 @@ impl Game {
         } else {
             EnemyKind::Basic
         };
+        self.spawn_targeted_enemy(start, target_slot, base_speed, kind);
+    }
 
+    fn maybe_spawn_air_support(&mut self) {
+        if !self.bomber_spawned_in_wave
+            && self.wave >= 3
+            && self.enemies_spawned >= self.enemies_to_spawn / 3
+        {
+            self.spawn_bomber();
+            self.bomber_spawned_in_wave = true;
+        }
+
+        if !self.satellite_spawned_in_wave
+            && self.wave >= 5
+            && self.enemies_spawned >= self.enemies_to_spawn / 2
+        {
+            self.spawn_satellite();
+            self.satellite_spawned_in_wave = true;
+        }
+    }
+
+    fn spawn_bomber(&mut self) {
+        let direction = if gen_range(0, 2) == 0 { 1.0 } else { -1.0 };
+        let start_x = if direction > 0.0 {
+            -90.0
+        } else {
+            self.layout.screen.x + 90.0
+        };
+        self.bombers.push(Bomber {
+            position: vec2(start_x, self.layout.screen.y * 0.46),
+            velocity: vec2(direction * (120.0 + self.wave as f32 * 4.0), 0.0),
+            drop_timer: 0.8,
+            wobble: gen_range(0.0, PI * 2.0),
+        });
+    }
+
+    fn spawn_satellite(&mut self) {
+        let direction = if gen_range(0, 2) == 0 { 1.0 } else { -1.0 };
+        let start_x = if direction > 0.0 {
+            -50.0
+        } else {
+            self.layout.screen.x + 50.0
+        };
+        self.satellites.push(Satellite {
+            position: vec2(start_x, self.layout.screen.y * 0.24),
+            velocity: vec2(direction * (220.0 + self.wave as f32 * 8.0), 0.0),
+            drop_timer: 0.45,
+            phase: gen_range(0.0, PI * 2.0),
+        });
+    }
+
+    fn spawn_air_dropped_missile(
+        &mut self,
+        start: Vec2,
+        speed_scale: f32,
+        smart_bias: f32,
+        splitter_bias: f32,
+    ) {
+        let Some(target_slot) = self.random_target_slot() else {
+            return;
+        };
+
+        let allow_smart = self.wave >= self.config.difficulty.smart_bomb_start_wave();
+        let roll = gen_range(0.0, 1.0);
+        let kind = if allow_smart && roll < smart_bias {
+            EnemyKind::SmartBomb {
+                dodges_left: 2,
+                cooldown: 0.0,
+                weave_phase: gen_range(0.0, PI * 2.0),
+            }
+        } else if self.wave >= 4 && roll < smart_bias + splitter_bias {
+            EnemyKind::Splitter {
+                split_progress: gen_range(0.42, 0.72),
+            }
+        } else {
+            EnemyKind::Basic
+        };
+
+        let speed = (86.0 + self.wave as f32 * 8.0)
+            * self.config.difficulty.enemy_speed_factor()
+            * speed_scale;
+        self.spawn_targeted_enemy(start, target_slot, speed, kind);
+    }
+
+    fn spawn_targeted_enemy(
+        &mut self,
+        start: Vec2,
+        target_slot: TargetSlot,
+        mut speed: f32,
+        kind: EnemyKind,
+    ) {
+        let target = self.target_position(target_slot);
+        if matches!(kind, EnemyKind::SmartBomb { .. }) {
+            speed *= 1.14;
+        }
         let color = match kind {
             EnemyKind::Basic => color_u8!(255, 94, 80, 255),
             EnemyKind::Splitter { .. } => color_u8!(255, 64, 200, 255),
@@ -985,7 +1248,7 @@ impl Game {
             start,
             target,
             target_slot,
-            speed: base_speed,
+            speed,
             kind,
             color,
         });
@@ -1054,6 +1317,8 @@ impl Game {
         self.paused = false;
         self.player_missiles.clear();
         self.enemy_missiles.clear();
+        self.bombers.clear();
+        self.satellites.clear();
         self.audio.play_game_over();
     }
 
@@ -1348,6 +1613,55 @@ impl Game {
         }
     }
 
+    fn draw_bombers(&self) {
+        for bomber in &self.bombers {
+            let body = color_u8!(255, 198, 104, 255);
+            let wing = color_u8!(255, 136, 72, 255);
+            draw_rectangle(
+                bomber.position.x - 22.0,
+                bomber.position.y - 5.0,
+                44.0,
+                10.0,
+                body,
+            );
+            draw_triangle(
+                vec2(bomber.position.x - 28.0, bomber.position.y),
+                vec2(bomber.position.x - 6.0, bomber.position.y - 10.0),
+                vec2(bomber.position.x - 6.0, bomber.position.y + 10.0),
+                wing,
+            );
+            draw_triangle(
+                vec2(bomber.position.x + 28.0, bomber.position.y),
+                vec2(bomber.position.x + 6.0, bomber.position.y - 10.0),
+                vec2(bomber.position.x + 6.0, bomber.position.y + 10.0),
+                wing,
+            );
+        }
+    }
+
+    fn draw_satellites(&self) {
+        for satellite in &self.satellites {
+            let glow = color_u8!(140, 230, 255, 120);
+            let hull = color_u8!(224, 246, 255, 255);
+            draw_circle(satellite.position.x, satellite.position.y, 11.0, glow);
+            draw_rectangle(
+                satellite.position.x - 12.0,
+                satellite.position.y - 2.0,
+                24.0,
+                4.0,
+                hull,
+            );
+            draw_line(
+                satellite.position.x,
+                satellite.position.y - 8.0,
+                satellite.position.x,
+                satellite.position.y + 8.0,
+                2.0,
+                hull,
+            );
+        }
+    }
+
     fn draw_enemy_missiles(&self) {
         for missile in &self.enemy_missiles {
             draw_line(
@@ -1363,6 +1677,15 @@ impl Game {
                 missile.color,
             );
             draw_circle(missile.position.x, missile.position.y, 3.6, WHITE);
+            if matches!(missile.kind, EnemyKind::SmartBomb { .. }) {
+                draw_circle_lines(
+                    missile.position.x,
+                    missile.position.y,
+                    6.2,
+                    1.2,
+                    missile.color,
+                );
+            }
         }
     }
 
