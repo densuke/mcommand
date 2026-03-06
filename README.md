@@ -7,6 +7,10 @@ Rust と `macroquad` で実装した `Missile Command` 風ゲームです。
 - ローカルアプリとしてのネイティブ実行
 - WebAssembly + HTML5 によるブラウザ実行
 
+公開中の Web 版:
+
+- https://densuke.github.io/mcommand/
+
 ## 現在の主な機能
 
 - フルスクリーン対応
@@ -144,6 +148,10 @@ GitHub Pages 用のワークフローを同梱しています。
 - リポジトリの `Settings > Pages` を開く
 - `Build and deployment` の `Source` を `GitHub Actions` に設定する
 
+現在のワークフローは `actions/configure-pages@v5` の `enablement: true` を使っているため、
+初回実行時に Pages が未有効でも、そのまま有効化される前提です。
+ただし、GitHub 側の権限やリポジトリ設定によっては手動確認が必要です。
+
 設定後は `main` へ push するだけで Pages へ公開されます。
 
 手動実行したい場合は GitHub の `Actions` タブから `Deploy Pages` を `Run workflow` してください。
@@ -222,3 +230,4 @@ Web ローカル配信:
 - 現在の Web 版は静的配信前提です
 - オンラインランキング機能はまだ実装していません
 - 今後は Web API を追加することで、ネイティブ版 / Web 版の両方から同じランキングへ参加できる構成を想定しています
+- 開発者向けのコードマップは [docs/code-structure.md](/Users/densuke/Documents/2026/03/06/mcommand/docs/code-structure.md) にまとめています

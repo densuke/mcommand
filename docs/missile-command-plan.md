@@ -1,5 +1,26 @@
 # Missile Command 実装メモ
 
+## 現状スナップショット
+- ネイティブ版: macOS を中心にプレイ可能な状態
+- Web 版: GitHub Pages で公開中
+  - https://densuke.github.io/mcommand/
+- デプロイ:
+  - `main` push -> GitHub Actions -> GitHub Pages
+- 現時点の到達点:
+  - タイトル画面、設定画面、ゲームオーバー導線
+  - 効果音 / 簡易 BGM
+  - 通常弾、分裂弾、スマートボム、爆撃機、衛星
+  - ネイティブ保存と Web `localStorage`
+
+## 主な節目コミット
+- `99c9d47` 初期プロトタイプ
+- `30281c5` タイトル画面 / 音 / 設定画面
+- `5e2b6f9` スマートボム / 爆撃機 / 衛星
+- `9eed6be` HTML5 / WASM 対応
+- `f888529` HTML5 起動修正と `localStorage` ブリッジ
+- `25929bb` GitHub Pages デプロイワークフロー
+- `d688280` ワークフローから GitHub Pages を有効化
+
 ## 目的
 - Rust 上で `Missile Command` ライクな防衛ゲームを再構築する。
 - 第1段階は macOS でのプレイ成立を最優先にする。
@@ -144,3 +165,13 @@
   - 設定とハイスコアは `localStorage` に保存する
 - ネイティブ向け保存
   - 簡易実装としてホームディレクトリの `.mcommand-save` に保存する
+
+## 次に触るときの優先整理候補
+- `src/game.rs` を以下の単位に段階的に分離する
+  - `config/save`
+  - `entities`
+  - `spawn`
+  - `render`
+  - `ui/title_settings_gameover`
+- まずは挙動変更を伴わない切り出しから始める
+- Web 版とネイティブ版の差分は入出力層だけに寄せる

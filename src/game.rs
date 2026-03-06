@@ -12,6 +12,7 @@ const CURSOR_SPEED: f32 = 720.0;
 const ENEMY_BLAST_RADIUS: f32 = 24.0;
 const CITY_RESTORE_STEP: u32 = 10_000;
 
+// Screen and difficulty state shared by native and web builds.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScreenState {
     Title,
@@ -146,6 +147,7 @@ impl Difficulty {
     }
 }
 
+// Runtime-adjustable options that are persisted across launches.
 #[derive(Clone, Copy)]
 struct GameConfig {
     ammo_per_base: i32,
@@ -216,6 +218,7 @@ impl GameConfig {
     }
 }
 
+// Small save blob used by native file storage and web localStorage.
 #[derive(Clone, Copy)]
 struct SaveData {
     config: GameConfig,
@@ -255,6 +258,7 @@ impl SaveData {
     }
 }
 
+// Dynamic layout recalculated from the current viewport size.
 #[derive(Clone, Copy)]
 struct Layout {
     screen: Vec2,
@@ -305,6 +309,7 @@ impl Layout {
     }
 }
 
+// Core world state.
 #[derive(Clone, Copy)]
 struct Base {
     position: Vec2,
@@ -397,6 +402,7 @@ struct Explosion {
     owner: ExplosionOwner,
 }
 
+// Generated audio assets and playback flags.
 #[derive(Default)]
 struct AudioBank {
     music: Option<Sound>,
@@ -482,6 +488,11 @@ impl AudioBank {
     }
 }
 
+// Central game state.
+//
+// This file is intentionally monolithic for now. If further changes accumulate,
+// the safest split points are: save/config, audio synthesis, spawning,
+// rendering, and UI screens.
 pub struct Game {
     layout: Layout,
     stars: Vec<Star>,
@@ -515,6 +526,7 @@ pub struct Game {
 }
 
 impl Game {
+    // Frame update and state transitions.
     pub async fn new(screen: Vec2) -> Self {
         let layout = Layout::new(screen);
         let cursor = vec2(screen.x * 0.5, screen.y * 0.38);
@@ -1567,6 +1579,7 @@ impl Game {
         ((self.wave.saturating_sub(1)) / 2 + 1).min(6)
     }
 
+    // UI and world rendering.
     fn draw_title_screen(&self) {
         draw_centered_text(
             "MISSILE COMMAND",
@@ -2047,6 +2060,7 @@ impl Game {
     }
 }
 
+// Shared drawing helpers.
 fn draw_sky(layout: Layout) {
     let bands = 12;
     let top = color_u8!(6, 10, 26, 255);
@@ -2203,6 +2217,7 @@ fn game_over_action_text() -> &'static str {
     }
 }
 
+// Persistence layer. Native uses a file in the home directory, web uses localStorage.
 fn load_save_data() -> SaveData {
     load_save_blob()
         .map(|raw| SaveData::decode(&raw))
@@ -2261,6 +2276,7 @@ unsafe extern "C" {
     fn mcommand_storage_set(ptr: *const u8, len: u32);
 }
 
+// Small procedural audio generator used to avoid external asset files.
 enum Waveform {
     Sine,
     Pulse(f32),
