@@ -6,10 +6,10 @@ use macroquad::prelude::*;
 fn window_conf() -> Conf {
     Conf {
         window_title: "mcommand".to_owned(),
-        fullscreen: true,
+        fullscreen: !cfg!(target_arch = "wasm32"),
         high_dpi: true,
         sample_count: 4,
-        window_resizable: false,
+        window_resizable: cfg!(target_arch = "wasm32"),
         ..Default::default()
     }
 }

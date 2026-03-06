@@ -5,6 +5,10 @@ use macroquad::audio::{
 };
 use macroquad::prelude::*;
 use macroquad::rand::gen_range;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::PathBuf;
+#[cfg(target_arch = "wasm32")]
+use web_sys::window;
 
 const CURSOR_SPEED: f32 = 720.0;
 const ENEMY_BLAST_RADIUS: f32 = 24.0;
@@ -40,6 +44,25 @@ impl Difficulty {
             Difficulty::Arcade => "ARCADE",
             Difficulty::Veteran => "VETERAN",
             Difficulty::Mayhem => "MAYHEM",
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Difficulty::Cadet => "cadet",
+            Difficulty::Arcade => "arcade",
+            Difficulty::Veteran => "veteran",
+            Difficulty::Mayhem => "mayhem",
+        }
+    }
+
+    fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "cadet" => Some(Difficulty::Cadet),
+            "arcade" => Some(Difficulty::Arcade),
+            "veteran" => Some(Difficulty::Veteran),
+            "mayhem" => Some(Difficulty::Mayhem),
+            _ => None,
         }
     }
 
@@ -150,6 +173,87 @@ impl GameConfig {
     fn clamp(&mut self) {
         self.ammo_per_base = self.ammo_per_base.clamp(4, 20);
         self.blast_radius = self.blast_radius.clamp(32.0, 96.0);
+    }
+
+    fn encode(self) -> String {
+        format!(
+            "ammo={}\nblast={:.0}\ndifficulty={}",
+            self.ammo_per_base,
+            self.blast_radius,
+            self.difficulty.code()
+        )
+    }
+
+    fn decode(raw: &str) -> Option<Self> {
+        let mut config = Self::default();
+        let mut touched = false;
+
+        for line in raw.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key.trim() {
+                "ammo" => {
+                    config.ammo_per_base = value.trim().parse().ok()?;
+                    touched = true;
+                }
+                "blast" => {
+                    config.blast_radius = value.trim().parse().ok()?;
+                    touched = true;
+                }
+                "difficulty" => {
+                    config.difficulty = Difficulty::from_code(value.trim())?;
+                    touched = true;
+                }
+                _ => {}
+            }
+        }
+
+        if touched {
+            config.clamp();
+            Some(config)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SaveData {
+    config: GameConfig,
+    high_score: u32,
+}
+
+impl Default for SaveData {
+    fn default() -> Self {
+        Self {
+            config: GameConfig::default(),
+            high_score: 0,
+        }
+    }
+}
+
+impl SaveData {
+    fn encode(self) -> String {
+        format!("{}\nhigh_score={}", self.config.encode(), self.high_score)
+    }
+
+    fn decode(raw: &str) -> Self {
+        let mut save = Self::default();
+        if let Some(config) = GameConfig::decode(raw) {
+            save.config = config;
+        }
+        for line in raw.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim() == "high_score" {
+                if let Ok(score) = value.trim().parse() {
+                    save.high_score = score;
+                }
+            }
+        }
+        save
     }
 }
 
@@ -398,6 +502,7 @@ pub struct Game {
     satellites: Vec<Satellite>,
     explosions: Vec<Explosion>,
     score: u32,
+    high_score: u32,
     next_city_restore_score: u32,
     wave: u32,
     enemies_to_spawn: u32,
@@ -415,6 +520,7 @@ impl Game {
     pub async fn new(screen: Vec2) -> Self {
         let layout = Layout::new(screen);
         let cursor = vec2(screen.x * 0.5, screen.y * 0.38);
+        let save_data = load_save_data();
         let mut game = Self {
             layout,
             stars: make_stars(screen),
@@ -422,7 +528,7 @@ impl Game {
             mode: ScreenState::Title,
             settings_return: ScreenState::Title,
             settings_cursor: 0,
-            config: GameConfig::default(),
+            config: save_data.config,
             cursor,
             last_mouse_position: None,
             bases: [Base {
@@ -440,6 +546,7 @@ impl Game {
             satellites: Vec::new(),
             explosions: Vec::new(),
             score: 0,
+            high_score: save_data.high_score,
             next_city_restore_score: CITY_RESTORE_STEP,
             wave: 1,
             enemies_to_spawn: 0,
@@ -460,8 +567,12 @@ impl Game {
         self.sync_layout();
         self.audio.ensure_music();
 
+        if is_key_pressed(KeyCode::F) {
+            self.request_fullscreen();
+        }
+
         if is_key_pressed(KeyCode::Q) {
-            return true;
+            return self.handle_quit_request();
         }
 
         match self.mode {
@@ -505,6 +616,50 @@ impl Game {
         }
     }
 
+    fn handle_quit_request(&mut self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            match self.mode {
+                ScreenState::Settings => self.mode = self.settings_return,
+                ScreenState::Playing | ScreenState::GameOver => self.return_to_title(),
+                ScreenState::Title => {}
+            }
+            false
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            true
+        }
+    }
+
+    fn request_fullscreen(&self) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            set_fullscreen(true);
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn return_to_title(&mut self) {
+        self.mode = ScreenState::Title;
+        self.paused = false;
+        self.score = 0;
+        self.next_city_restore_score = CITY_RESTORE_STEP;
+        self.wave = 1;
+        self.enemies_to_spawn = 0;
+        self.enemies_spawned = 0;
+        self.spawn_timer = 0.0;
+        self.intermission_timer = 0.0;
+        self.wave_banner_timer = 0.0;
+        self.player_missiles.clear();
+        self.enemy_missiles.clear();
+        self.bombers.clear();
+        self.satellites.clear();
+        self.explosions.clear();
+        self.populate_defense_line();
+    }
+
     fn update_title(&mut self) {
         if is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::Space) {
             self.audio.play_start();
@@ -542,6 +697,7 @@ impl Game {
         }
         if is_key_pressed(KeyCode::R) {
             self.config.restore_defaults();
+            self.persist_save();
             self.audio.play_ui_move();
         }
         if is_key_pressed(KeyCode::Enter) && self.settings_cursor == 3 {
@@ -558,6 +714,7 @@ impl Game {
             _ => return,
         }
         self.config.clamp();
+        self.persist_save();
         self.audio.play_ui_move();
     }
 
@@ -703,6 +860,13 @@ impl Game {
         self.award_points(saved_cities * 100);
         self.award_points(unused_missiles * 5);
         self.intermission_timer = 2.8;
+    }
+
+    fn persist_save(&self) {
+        store_save_data(SaveData {
+            config: self.config,
+            high_score: self.high_score.max(self.score),
+        });
     }
 
     fn air_support_quota_for_wave(&self) -> u32 {
@@ -1368,6 +1532,10 @@ impl Game {
     }
 
     fn trigger_game_over(&mut self) {
+        if self.score > self.high_score {
+            self.high_score = self.score;
+            self.persist_save();
+        }
         self.mode = ScreenState::GameOver;
         self.paused = false;
         self.player_missiles.clear();
@@ -1384,6 +1552,10 @@ impl Game {
     fn award_points(&mut self, base_points: u32) {
         let points = base_points * self.score_multiplier();
         self.score = self.score.saturating_add(points);
+        if self.score > self.high_score {
+            self.high_score = self.score;
+            self.persist_save();
+        }
 
         while self.score >= self.next_city_restore_score {
             if let Some(city) = self.cities.iter_mut().find(|city| !city.alive) {
@@ -1425,7 +1597,7 @@ impl Game {
             color_u8!(142, 255, 180, 255),
         );
         draw_centered_text(
-            "O / S  SETTINGS    Q  QUIT",
+            title_action_text(),
             self.layout.screen * 0.5 + vec2(0.0, 18.0),
             24,
             color_u8!(236, 242, 248, 255),
@@ -1446,6 +1618,12 @@ impl Game {
             self.layout.screen * 0.5 + vec2(0.0, 108.0),
             20,
             color_u8!(196, 206, 214, 255),
+        );
+        draw_centered_text(
+            &format!("HIGH SCORE {:06}   F FULLSCREEN", self.high_score),
+            self.layout.screen * 0.5 + vec2(0.0, 146.0),
+            20,
+            color_u8!(196, 204, 212, 255),
         );
     }
 
@@ -1560,6 +1738,16 @@ impl Game {
             },
         );
         draw_text_ex(
+            &format!("HIGH {:06}", self.high_score),
+            left,
+            top + 58.0,
+            TextParams {
+                font_size: 20,
+                color: color_u8!(236, 216, 142, 255),
+                ..Default::default()
+            },
+        );
+        draw_text_ex(
             &format!(
                 "AMMO {}  BLAST {:.0}px  {}",
                 self.config.ammo_per_base,
@@ -1575,7 +1763,7 @@ impl Game {
             },
         );
         draw_text_ex(
-            "MOVE: ARROWS / MOUSE   FIRE: Z X C   PAUSE: SPACE/P   QUIT: Q",
+            footer_action_text(),
             left,
             self.layout.screen.y - 18.0,
             TextParams {
@@ -1650,7 +1838,7 @@ impl Game {
             color_u8!(240, 228, 220, 255),
         );
         draw_centered_text(
-            "ENTER/R RESTART   T TITLE   O/S SETTINGS   Q QUIT",
+            game_over_action_text(),
             self.layout.screen * 0.5 + vec2(0.0, 42.0),
             22,
             color_u8!(220, 228, 236, 255),
@@ -1982,6 +2170,83 @@ fn enemy_score(kind: EnemyKind) -> u32 {
         EnemyKind::Basic | EnemyKind::Splitter { .. } => 25,
         EnemyKind::SmartBomb { .. } => 125,
     }
+}
+
+fn title_action_text() -> &'static str {
+    #[cfg(target_arch = "wasm32")]
+    {
+        "O / S  SETTINGS    Q  BACK    F  FULLSCREEN"
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        "O / S  SETTINGS    Q  QUIT    F  FULLSCREEN"
+    }
+}
+
+fn footer_action_text() -> &'static str {
+    #[cfg(target_arch = "wasm32")]
+    {
+        "MOVE: ARROWS / MOUSE   FIRE: Z X C   PAUSE: SPACE/P   Q: TITLE/BACK   F: FULLSCREEN"
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        "MOVE: ARROWS / MOUSE   FIRE: Z X C   PAUSE: SPACE/P   Q: QUIT   F: FULLSCREEN"
+    }
+}
+
+fn game_over_action_text() -> &'static str {
+    #[cfg(target_arch = "wasm32")]
+    {
+        "ENTER/R RESTART   T TITLE   O/S SETTINGS   Q TITLE   F FULLSCREEN"
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        "ENTER/R RESTART   T TITLE   O/S SETTINGS   Q QUIT   F FULLSCREEN"
+    }
+}
+
+fn load_save_data() -> SaveData {
+    load_save_blob()
+        .map(|raw| SaveData::decode(&raw))
+        .unwrap_or_default()
+}
+
+fn store_save_data(save: SaveData) {
+    store_save_blob(&save.encode());
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_save_blob() -> Option<String> {
+    window()
+        .and_then(|window| window.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item("mcommand.save").ok().flatten())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_save_blob() -> Option<String> {
+    std::fs::read_to_string(native_save_path()).ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn store_save_blob(raw: &str) {
+    if let Some(storage) = window().and_then(|window| window.local_storage().ok().flatten()) {
+        let _ = storage.set_item("mcommand.save", raw);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn store_save_blob(raw: &str) {
+    let _ = std::fs::write(native_save_path(), raw);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn native_save_path() -> PathBuf {
+    let mut path = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+    path.push(".mcommand-save");
+    path
 }
 
 enum Waveform {

@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mcommand</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg0: #050812;
+      --bg1: #0f1d34;
+      --line: #88ffc3;
+      --text: #eaf2fb;
+      --muted: #9eb3c8;
+      --accent: #ffd37e;
+    }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background:
+        radial-gradient(circle at top, rgba(90, 126, 185, 0.2), transparent 35%),
+        linear-gradient(180deg, var(--bg1), var(--bg0));
+      color: var(--text);
+      font-family: "Avenir Next", "Helvetica Neue", Helvetica, Arial, sans-serif;
+      overflow: hidden;
+    }
+    body {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+    }
+    header, footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 16px;
+      background: rgba(4, 8, 18, 0.7);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid rgba(136, 255, 195, 0.18);
+      z-index: 2;
+    }
+    footer {
+      border-top: 1px solid rgba(136, 255, 195, 0.18);
+      border-bottom: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .title {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      font-size: 14px;
+      color: var(--muted);
+    }
+    .shell {
+      position: relative;
+      min-height: 0;
+    }
+    #glcanvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      outline: none;
+    }
+    .button {
+      border: 1px solid rgba(136, 255, 195, 0.28);
+      border-radius: 999px;
+      color: var(--text);
+      background: rgba(10, 18, 32, 0.72);
+      padding: 8px 12px;
+      font: inherit;
+      cursor: pointer;
+    }
+    .button:hover {
+      border-color: rgba(136, 255, 195, 0.5);
+      background: rgba(16, 28, 48, 0.88);
+    }
+    @media (max-width: 720px) {
+      header, footer {
+        padding: 8px 10px;
+      }
+      .actions {
+        font-size: 12px;
+      }
+      .title {
+        font-size: 14px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title">mcommand / HTML5</div>
+    <div class="actions">
+      <button class="button" id="fullscreen-btn" type="button">Fullscreen</button>
+      <span>Static deployment target</span>
+    </div>
+  </header>
+  <main class="shell">
+    <canvas id="glcanvas" tabindex="1"></canvas>
+  </main>
+  <footer>
+    <span>Controls: arrows or mouse / Z X C / Space P / F fullscreen</span>
+    <span>Web build stores config and high score in localStorage</span>
+  </footer>
+  <script src="mq_js_bundle.js"></script>
+  <script>
+    const canvas = document.getElementById('glcanvas');
+    const fullscreenButton = document.getElementById('fullscreen-btn');
+    fullscreenButton.addEventListener('click', () => {
+      if (canvas.requestFullscreen) {
+        canvas.requestFullscreen();
+      }
+      canvas.focus();
+    });
+    window.addEventListener('load', () => {
+      canvas.focus();
+      load('mcommand.wasm');
+    });
+  </script>
+</body>
+</html>
