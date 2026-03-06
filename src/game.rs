@@ -73,27 +73,45 @@ impl Difficulty {
     fn wave_density_bonus(self) -> u32 {
         match self {
             Difficulty::Cadet => 0,
-            Difficulty::Arcade => 2,
-            Difficulty::Veteran => 4,
-            Difficulty::Mayhem => 6,
+            Difficulty::Arcade => 1,
+            Difficulty::Veteran => 3,
+            Difficulty::Mayhem => 5,
         }
     }
 
     fn smart_bomb_start_wave(self) -> u32 {
         match self {
-            Difficulty::Cadet => u32::MAX,
-            Difficulty::Arcade => 4,
-            Difficulty::Veteran => 3,
-            Difficulty::Mayhem => 2,
+            Difficulty::Cadet => 8,
+            Difficulty::Arcade => 6,
+            Difficulty::Veteran => 5,
+            Difficulty::Mayhem => 4,
         }
     }
 
     fn smart_bomb_chance(self) -> f32 {
         match self {
-            Difficulty::Cadet => 0.0,
-            Difficulty::Arcade => 0.08,
-            Difficulty::Veteran => 0.14,
-            Difficulty::Mayhem => 0.22,
+            Difficulty::Cadet => 0.04,
+            Difficulty::Arcade => 0.09,
+            Difficulty::Veteran => 0.15,
+            Difficulty::Mayhem => 0.24,
+        }
+    }
+
+    fn air_support_start_wave(self) -> u32 {
+        match self {
+            Difficulty::Cadet => 3,
+            Difficulty::Arcade => 2,
+            Difficulty::Veteran => 2,
+            Difficulty::Mayhem => 2,
+        }
+    }
+
+    fn air_support_count_bonus(self) -> u32 {
+        match self {
+            Difficulty::Cadet => 0,
+            Difficulty::Arcade => 1,
+            Difficulty::Veteran => 2,
+            Difficulty::Mayhem => 3,
         }
     }
 
@@ -387,8 +405,9 @@ pub struct Game {
     spawn_timer: f32,
     intermission_timer: f32,
     wave_banner_timer: f32,
-    bomber_spawned_in_wave: bool,
-    satellite_spawned_in_wave: bool,
+    air_support_remaining: u32,
+    air_support_cooldown: f32,
+    next_air_support_satellite: bool,
     paused: bool,
 }
 
@@ -428,8 +447,9 @@ impl Game {
             spawn_timer: 0.0,
             intermission_timer: 0.0,
             wave_banner_timer: 0.0,
-            bomber_spawned_in_wave: false,
-            satellite_spawned_in_wave: false,
+            air_support_remaining: 0,
+            air_support_cooldown: 0.0,
+            next_air_support_satellite: false,
             paused: false,
         };
         game.populate_defense_line();
@@ -650,13 +670,14 @@ impl Game {
     }
 
     fn begin_wave(&mut self) {
-        self.enemies_to_spawn = 10 + self.wave * 3 + self.config.difficulty.wave_density_bonus();
+        self.enemies_to_spawn = 12 + self.wave * 2 + self.config.difficulty.wave_density_bonus();
         self.enemies_spawned = 0;
         self.spawn_timer = 1.0;
         self.intermission_timer = 0.0;
         self.wave_banner_timer = 1.75;
-        self.bomber_spawned_in_wave = false;
-        self.satellite_spawned_in_wave = false;
+        self.air_support_remaining = self.air_support_quota_for_wave();
+        self.air_support_cooldown = 1.2;
+        self.next_air_support_satellite = self.wave % 2 == 0;
         self.player_missiles.clear();
         self.enemy_missiles.clear();
         self.bombers.clear();
@@ -682,6 +703,20 @@ impl Game {
         self.award_points(saved_cities * 100);
         self.award_points(unused_missiles * 5);
         self.intermission_timer = 2.8;
+    }
+
+    fn air_support_quota_for_wave(&self) -> u32 {
+        if self.wave < self.config.difficulty.air_support_start_wave() {
+            return 0;
+        }
+
+        let base = match self.wave {
+            0..=2 => 0,
+            3..=4 => 1,
+            5..=7 => 2,
+            _ => 3,
+        };
+        base + self.config.difficulty.air_support_count_bonus()
     }
 
     fn sync_layout(&mut self) {
@@ -954,7 +989,16 @@ impl Game {
         });
 
         for drop in drops {
-            self.spawn_air_dropped_missile(drop, 1.08, 0.0, 0.15);
+            let burst = if self.wave >= 8 {
+                3
+            } else if self.wave >= 5 {
+                2
+            } else {
+                1
+            };
+            for _ in 0..burst {
+                self.spawn_air_dropped_missile(drop, 1.02, 0.0, 0.12);
+            }
         }
     }
 
@@ -977,12 +1021,15 @@ impl Game {
         });
 
         for drop in drops {
-            self.spawn_air_dropped_missile(
-                drop,
-                1.18,
-                self.config.difficulty.smart_bomb_chance() * 0.8 + 0.08,
-                0.0,
-            );
+            let burst = if self.wave >= 7 { 2 } else { 1 };
+            for _ in 0..burst {
+                self.spawn_air_dropped_missile(
+                    drop,
+                    1.14,
+                    self.config.difficulty.smart_bomb_chance() * 0.55,
+                    0.0,
+                );
+            }
         }
     }
 
@@ -1012,7 +1059,7 @@ impl Game {
             });
 
             if hit {
-                score_events += 25;
+                score_events += enemy_score(missile.kind);
                 detonations.push(Explosion {
                     position: missile.position,
                     radius: 6.0,
@@ -1052,7 +1099,7 @@ impl Game {
                 .iter()
                 .any(|(position, radius)| bomber.position.distance(*position) <= *radius + 24.0);
             if hit {
-                score += 125;
+                score += 100;
                 detonations.push(Explosion {
                     position: bomber.position,
                     radius: 10.0,
@@ -1073,7 +1120,7 @@ impl Game {
                 .iter()
                 .any(|(position, radius)| satellite.position.distance(*position) <= *radius + 16.0);
             if hit {
-                score += 175;
+                score += 100;
                 smart_sound = true;
                 detonations.push(Explosion {
                     position: satellite.position,
@@ -1102,7 +1149,7 @@ impl Game {
 
     fn update_wave_spawning(&mut self, dt: f32) {
         if self.enemies_spawned >= self.enemies_to_spawn {
-            self.maybe_spawn_air_support();
+            self.maybe_spawn_air_support(dt);
             return;
         }
 
@@ -1112,7 +1159,7 @@ impl Game {
             self.enemies_spawned += 1;
             self.spawn_timer += self.next_spawn_interval();
         }
-        self.maybe_spawn_air_support();
+        self.maybe_spawn_air_support(dt);
     }
 
     fn spawn_enemy_missile(&mut self) {
@@ -1145,22 +1192,30 @@ impl Game {
         self.spawn_targeted_enemy(start, target_slot, base_speed, kind);
     }
 
-    fn maybe_spawn_air_support(&mut self) {
-        if !self.bomber_spawned_in_wave
-            && self.wave >= 3
-            && self.enemies_spawned >= self.enemies_to_spawn / 3
-        {
-            self.spawn_bomber();
-            self.bomber_spawned_in_wave = true;
+    fn maybe_spawn_air_support(&mut self, dt: f32) {
+        if self.air_support_remaining == 0 {
+            return;
+        }
+        if self.wave < self.config.difficulty.air_support_start_wave() {
+            return;
+        }
+        if !self.bombers.is_empty() || !self.satellites.is_empty() {
+            return;
         }
 
-        if !self.satellite_spawned_in_wave
-            && self.wave >= 5
-            && self.enemies_spawned >= self.enemies_to_spawn / 2
-        {
-            self.spawn_satellite();
-            self.satellite_spawned_in_wave = true;
+        self.air_support_cooldown -= dt;
+        if self.air_support_cooldown > 0.0 {
+            return;
         }
+
+        if self.next_air_support_satellite && self.wave >= 4 {
+            self.spawn_satellite();
+        } else {
+            self.spawn_bomber();
+        }
+        self.next_air_support_satellite = !self.next_air_support_satellite;
+        self.air_support_remaining = self.air_support_remaining.saturating_sub(1);
+        self.air_support_cooldown = (2.0 - self.wave as f32 * 0.05).clamp(0.75, 2.0);
     }
 
     fn spawn_bomber(&mut self) {
@@ -1172,8 +1227,8 @@ impl Game {
         };
         self.bombers.push(Bomber {
             position: vec2(start_x, self.layout.screen.y * 0.46),
-            velocity: vec2(direction * (120.0 + self.wave as f32 * 4.0), 0.0),
-            drop_timer: 0.8,
+            velocity: vec2(direction * (104.0 + self.wave as f32 * 3.5), 0.0),
+            drop_timer: 0.95,
             wobble: gen_range(0.0, PI * 2.0),
         });
     }
@@ -1187,8 +1242,8 @@ impl Game {
         };
         self.satellites.push(Satellite {
             position: vec2(start_x, self.layout.screen.y * 0.24),
-            velocity: vec2(direction * (220.0 + self.wave as f32 * 8.0), 0.0),
-            drop_timer: 0.45,
+            velocity: vec2(direction * (190.0 + self.wave as f32 * 7.0), 0.0),
+            drop_timer: 0.62,
             phase: gen_range(0.0, PI * 2.0),
         });
     }
@@ -1920,6 +1975,13 @@ fn nearest_blast(position: Vec2, blasts: &[(Vec2, f32)]) -> Option<(Vec2, f32)> 
                 .unwrap_or(core::cmp::Ordering::Equal)
         })
         .copied()
+}
+
+fn enemy_score(kind: EnemyKind) -> u32 {
+    match kind {
+        EnemyKind::Basic | EnemyKind::Splitter { .. } => 25,
+        EnemyKind::SmartBomb { .. } => 125,
+    }
 }
 
 enum Waveform {
