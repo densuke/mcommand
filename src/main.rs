@@ -16,7 +16,7 @@ fn window_conf() -> Conf {
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    let mut game = Game::new(vec2(screen_width(), screen_height()));
+    let mut game = Game::new(vec2(screen_width(), screen_height())).await;
 
     loop {
         let dt = get_frame_time().min(1.0 / 30.0);

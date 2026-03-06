@@ -1,11 +1,139 @@
+use core::f32::consts::PI;
+
+use macroquad::audio::{
+    PlaySoundParams, Sound, load_sound_from_bytes, play_sound, play_sound_once,
+};
 use macroquad::prelude::*;
 use macroquad::rand::gen_range;
 
-const BASE_AMMO: i32 = 10;
 const CURSOR_SPEED: f32 = 720.0;
-const PLAYER_MAX_RADIUS: f32 = 58.0;
 const ENEMY_BLAST_RADIUS: f32 = 24.0;
 const CITY_RESTORE_STEP: u32 = 10_000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScreenState {
+    Title,
+    Settings,
+    Playing,
+    GameOver,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Difficulty {
+    Cadet,
+    Arcade,
+    Veteran,
+    Mayhem,
+}
+
+impl Difficulty {
+    const ALL: [Difficulty; 4] = [
+        Difficulty::Cadet,
+        Difficulty::Arcade,
+        Difficulty::Veteran,
+        Difficulty::Mayhem,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Difficulty::Cadet => "CADET",
+            Difficulty::Arcade => "ARCADE",
+            Difficulty::Veteran => "VETERAN",
+            Difficulty::Mayhem => "MAYHEM",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Difficulty::Cadet => "slow waves, no smart bombs",
+            Difficulty::Arcade => "balanced waves, arcade-first",
+            Difficulty::Veteran => "faster missiles, early specials",
+            Difficulty::Mayhem => "dense salvos, high smart-bomb rate",
+        }
+    }
+
+    fn enemy_speed_factor(self) -> f32 {
+        match self {
+            Difficulty::Cadet => 0.86,
+            Difficulty::Arcade => 1.0,
+            Difficulty::Veteran => 1.14,
+            Difficulty::Mayhem => 1.28,
+        }
+    }
+
+    fn spawn_factor(self) -> f32 {
+        match self {
+            Difficulty::Cadet => 1.18,
+            Difficulty::Arcade => 1.0,
+            Difficulty::Veteran => 0.86,
+            Difficulty::Mayhem => 0.72,
+        }
+    }
+
+    fn wave_density_bonus(self) -> u32 {
+        match self {
+            Difficulty::Cadet => 0,
+            Difficulty::Arcade => 2,
+            Difficulty::Veteran => 4,
+            Difficulty::Mayhem => 6,
+        }
+    }
+
+    fn smart_bomb_start_wave(self) -> u32 {
+        match self {
+            Difficulty::Cadet => u32::MAX,
+            Difficulty::Arcade => 4,
+            Difficulty::Veteran => 3,
+            Difficulty::Mayhem => 2,
+        }
+    }
+
+    fn smart_bomb_chance(self) -> f32 {
+        match self {
+            Difficulty::Cadet => 0.0,
+            Difficulty::Arcade => 0.08,
+            Difficulty::Veteran => 0.14,
+            Difficulty::Mayhem => 0.22,
+        }
+    }
+
+    fn next(self, delta: i32) -> Difficulty {
+        let index = Self::ALL
+            .iter()
+            .position(|entry| *entry == self)
+            .unwrap_or(1) as i32;
+        let next = (index + delta).rem_euclid(Self::ALL.len() as i32) as usize;
+        Self::ALL[next]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GameConfig {
+    ammo_per_base: i32,
+    blast_radius: f32,
+    difficulty: Difficulty,
+}
+
+impl Default for GameConfig {
+    fn default() -> Self {
+        Self {
+            ammo_per_base: 10,
+            blast_radius: 58.0,
+            difficulty: Difficulty::Arcade,
+        }
+    }
+}
+
+impl GameConfig {
+    fn restore_defaults(&mut self) {
+        *self = Self::default();
+    }
+
+    fn clamp(&mut self) {
+        self.ammo_per_base = self.ammo_per_base.clamp(4, 20);
+        self.blast_radius = self.blast_radius.clamp(32.0, 96.0);
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Layout {
@@ -93,6 +221,7 @@ struct TargetSlot {
 enum EnemyKind {
     Basic,
     Splitter { split_progress: f32 },
+    SmartBomb { dodges_left: u8, cooldown: f32 },
 }
 
 struct PlayerMissile {
@@ -128,9 +257,99 @@ struct Explosion {
     owner: ExplosionOwner,
 }
 
+#[derive(Default)]
+struct AudioBank {
+    music: Option<Sound>,
+    fire: Option<Sound>,
+    explosion: Option<Sound>,
+    smart_bomb: Option<Sound>,
+    ui_move: Option<Sound>,
+    start: Option<Sound>,
+    game_over: Option<Sound>,
+    music_started: bool,
+}
+
+impl AudioBank {
+    async fn load() -> Self {
+        Self {
+            music: load_sound_from_bytes(&make_music_wav()).await.ok(),
+            fire: load_sound_from_bytes(&make_tone_wav(430.0, 0.08, 0.25, Waveform::Pulse(0.35)))
+                .await
+                .ok(),
+            explosion: load_sound_from_bytes(&make_noise_wav(0.22, 0.40))
+                .await
+                .ok(),
+            smart_bomb: load_sound_from_bytes(&make_smart_bomb_wav()).await.ok(),
+            ui_move: load_sound_from_bytes(&make_tone_wav(780.0, 0.05, 0.12, Waveform::Sine))
+                .await
+                .ok(),
+            start: load_sound_from_bytes(&make_start_wav()).await.ok(),
+            game_over: load_sound_from_bytes(&make_game_over_wav()).await.ok(),
+            music_started: false,
+        }
+    }
+
+    fn ensure_music(&mut self) {
+        if self.music_started {
+            return;
+        }
+        if let Some(sound) = &self.music {
+            play_sound(
+                sound,
+                PlaySoundParams {
+                    looped: true,
+                    volume: 0.28,
+                },
+            );
+            self.music_started = true;
+        }
+    }
+
+    fn play_fire(&self) {
+        if let Some(sound) = &self.fire {
+            play_sound_once(sound);
+        }
+    }
+
+    fn play_explosion(&self) {
+        if let Some(sound) = &self.explosion {
+            play_sound_once(sound);
+        }
+    }
+
+    fn play_smart_bomb(&self) {
+        if let Some(sound) = &self.smart_bomb {
+            play_sound_once(sound);
+        }
+    }
+
+    fn play_ui_move(&self) {
+        if let Some(sound) = &self.ui_move {
+            play_sound_once(sound);
+        }
+    }
+
+    fn play_start(&self) {
+        if let Some(sound) = &self.start {
+            play_sound_once(sound);
+        }
+    }
+
+    fn play_game_over(&self) {
+        if let Some(sound) = &self.game_over {
+            play_sound_once(sound);
+        }
+    }
+}
+
 pub struct Game {
     layout: Layout,
     stars: Vec<Star>,
+    audio: AudioBank,
+    mode: ScreenState,
+    settings_return: ScreenState,
+    settings_cursor: usize,
+    config: GameConfig,
     cursor: Vec2,
     last_mouse_position: Option<Vec2>,
     bases: [Base; 3],
@@ -147,21 +366,25 @@ pub struct Game {
     intermission_timer: f32,
     wave_banner_timer: f32,
     paused: bool,
-    game_over: bool,
 }
 
 impl Game {
-    pub fn new(screen: Vec2) -> Self {
+    pub async fn new(screen: Vec2) -> Self {
         let layout = Layout::new(screen);
         let cursor = vec2(screen.x * 0.5, screen.y * 0.38);
         let mut game = Self {
             layout,
             stars: make_stars(screen),
+            audio: AudioBank::load().await,
+            mode: ScreenState::Title,
+            settings_return: ScreenState::Title,
+            settings_cursor: 0,
+            config: GameConfig::default(),
             cursor,
             last_mouse_position: None,
             bases: [Base {
                 position: vec2(0.0, 0.0),
-                ammo: BASE_AMMO,
+                ammo: 0,
                 alive: true,
             }; 3],
             cities: [City {
@@ -178,30 +401,144 @@ impl Game {
             enemies_spawned: 0,
             spawn_timer: 0.0,
             intermission_timer: 0.0,
-            wave_banner_timer: 1.5,
+            wave_banner_timer: 0.0,
             paused: false,
-            game_over: false,
         };
-        game.reset_campaign();
+        game.populate_defense_line();
         game
     }
 
     pub fn update(&mut self, dt: f32) -> bool {
+        self.sync_layout();
+        self.audio.ensure_music();
+
         if is_key_pressed(KeyCode::Q) {
             return true;
         }
 
-        if is_key_pressed(KeyCode::Space) || is_key_pressed(KeyCode::P) {
-            if !self.game_over {
-                self.paused = !self.paused;
+        match self.mode {
+            ScreenState::Title => self.update_title(),
+            ScreenState::Settings => self.update_settings(),
+            ScreenState::Playing => self.update_playing(dt),
+            ScreenState::GameOver => self.update_game_over(),
+        }
+
+        false
+    }
+
+    pub fn draw(&self) {
+        draw_sky(self.layout);
+        draw_ground(self.layout);
+        self.draw_stars();
+
+        if matches!(self.mode, ScreenState::Playing | ScreenState::GameOver) {
+            self.draw_enemy_missiles();
+            self.draw_player_missiles();
+            self.draw_explosions();
+        }
+
+        self.draw_cities();
+        self.draw_bases();
+
+        match self.mode {
+            ScreenState::Title => self.draw_title_screen(),
+            ScreenState::Settings => self.draw_settings_screen(),
+            ScreenState::Playing => {
+                self.draw_cursor();
+                self.draw_hud();
+                self.draw_play_overlay();
             }
+            ScreenState::GameOver => {
+                self.draw_hud();
+                self.draw_game_over_screen();
+            }
+        }
+    }
+
+    fn update_title(&mut self) {
+        if is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::Space) {
+            self.audio.play_start();
+            self.start_campaign();
+        }
+
+        if is_key_pressed(KeyCode::O) || is_key_pressed(KeyCode::S) {
+            self.settings_return = ScreenState::Title;
+            self.settings_cursor = 0;
+            self.mode = ScreenState::Settings;
+            self.audio.play_ui_move();
+        }
+    }
+
+    fn update_settings(&mut self) {
+        if is_key_pressed(KeyCode::Escape) {
+            self.mode = self.settings_return;
+            self.audio.play_ui_move();
+            return;
+        }
+
+        if is_key_pressed(KeyCode::Up) {
+            self.settings_cursor = self.settings_cursor.saturating_sub(1);
+            self.audio.play_ui_move();
+        }
+        if is_key_pressed(KeyCode::Down) {
+            self.settings_cursor = (self.settings_cursor + 1).min(3);
+            self.audio.play_ui_move();
+        }
+        if is_key_pressed(KeyCode::Left) {
+            self.adjust_setting(-1);
+        }
+        if is_key_pressed(KeyCode::Right) {
+            self.adjust_setting(1);
+        }
+        if is_key_pressed(KeyCode::R) {
+            self.config.restore_defaults();
+            self.audio.play_ui_move();
+        }
+        if is_key_pressed(KeyCode::Enter) && self.settings_cursor == 3 {
+            self.mode = self.settings_return;
+            self.audio.play_ui_move();
+        }
+    }
+
+    fn adjust_setting(&mut self, delta: i32) {
+        match self.settings_cursor {
+            0 => self.config.ammo_per_base += delta,
+            1 => self.config.blast_radius += delta as f32 * 4.0,
+            2 => self.config.difficulty = self.config.difficulty.next(delta),
+            _ => return,
+        }
+        self.config.clamp();
+        self.audio.play_ui_move();
+    }
+
+    fn update_game_over(&mut self) {
+        if is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::R) {
+            self.audio.play_start();
+            self.start_campaign();
+        }
+        if is_key_pressed(KeyCode::T) {
+            self.mode = ScreenState::Title;
+            self.audio.play_ui_move();
+        }
+        if is_key_pressed(KeyCode::O) || is_key_pressed(KeyCode::S) {
+            self.settings_return = ScreenState::GameOver;
+            self.settings_cursor = 0;
+            self.mode = ScreenState::Settings;
+            self.audio.play_ui_move();
+        }
+    }
+
+    fn update_playing(&mut self, dt: f32) {
+        if is_key_pressed(KeyCode::Space) || is_key_pressed(KeyCode::P) {
+            self.paused = !self.paused;
+            self.audio.play_ui_move();
         }
 
         self.update_cursor(dt);
         self.handle_fire_input();
 
-        if self.paused || self.game_over {
-            return false;
+        if self.paused {
+            return;
         }
 
         if self.wave_banner_timer > 0.0 {
@@ -214,7 +551,7 @@ impl Game {
                 self.wave += 1;
                 self.begin_wave();
             }
-            return false;
+            return;
         }
 
         self.update_player_missiles(dt);
@@ -229,35 +566,15 @@ impl Game {
         {
             self.finish_wave();
         }
-
-        false
     }
 
-    pub fn draw(&self) {
-        draw_sky(self.layout);
-        draw_ground(self.layout);
-        self.draw_stars();
-        self.draw_enemy_missiles();
-        self.draw_player_missiles();
-        self.draw_explosions();
-        self.draw_cities();
-        self.draw_bases();
-        self.draw_cursor();
-        self.draw_hud();
-        self.draw_overlay();
-    }
-
-    fn reset_campaign(&mut self) {
+    fn start_campaign(&mut self) {
+        self.config.clamp();
+        self.mode = ScreenState::Playing;
+        self.paused = false;
         self.score = 0;
         self.next_city_restore_score = CITY_RESTORE_STEP;
         self.wave = 1;
-        self.enemies_spawned = 0;
-        self.enemies_to_spawn = 0;
-        self.spawn_timer = 0.0;
-        self.intermission_timer = 0.0;
-        self.wave_banner_timer = 2.0;
-        self.paused = false;
-        self.game_over = false;
         self.player_missiles.clear();
         self.enemy_missiles.clear();
         self.explosions.clear();
@@ -265,11 +582,10 @@ impl Game {
         for (index, base) in self.bases.iter_mut().enumerate() {
             *base = Base {
                 position: self.layout.base_positions[index],
-                ammo: BASE_AMMO,
+                ammo: self.config.ammo_per_base,
                 alive: true,
             };
         }
-
         for (index, city) in self.cities.iter_mut().enumerate() {
             *city = City {
                 position: self.layout.city_positions[index],
@@ -280,29 +596,40 @@ impl Game {
         self.begin_wave();
     }
 
-    fn begin_wave(&mut self) {
-        self.enemies_to_spawn = 12 + self.wave * 3;
-        self.enemies_spawned = 0;
-        self.spawn_timer = 1.1;
-        self.wave_banner_timer = 1.75;
-        self.player_missiles.clear();
-        self.enemy_missiles.clear();
-        self.explosions.clear();
-
+    fn populate_defense_line(&mut self) {
         for (index, base) in self.bases.iter_mut().enumerate() {
             *base = Base {
                 position: self.layout.base_positions[index],
-                ammo: BASE_AMMO,
+                ammo: self.config.ammo_per_base,
+                alive: true,
+            };
+        }
+        for (index, city) in self.cities.iter_mut().enumerate() {
+            *city = City {
+                position: self.layout.city_positions[index],
                 alive: true,
             };
         }
     }
 
-    fn finish_wave(&mut self) {
-        if self.game_over {
-            return;
-        }
+    fn begin_wave(&mut self) {
+        self.enemies_to_spawn = 10 + self.wave * 3 + self.config.difficulty.wave_density_bonus();
+        self.enemies_spawned = 0;
+        self.spawn_timer = 1.0;
+        self.intermission_timer = 0.0;
+        self.wave_banner_timer = 1.75;
+        self.player_missiles.clear();
+        self.enemy_missiles.clear();
+        self.explosions.clear();
 
+        for base in &mut self.bases {
+            if base.alive {
+                base.ammo = self.config.ammo_per_base;
+            }
+        }
+    }
+
+    fn finish_wave(&mut self) {
         let saved_cities = self.living_city_count() as u32;
         let unused_missiles: u32 = self
             .bases
@@ -314,6 +641,25 @@ impl Game {
         self.award_points(saved_cities * 100);
         self.award_points(unused_missiles * 5);
         self.intermission_timer = 2.8;
+    }
+
+    fn sync_layout(&mut self) {
+        let screen = vec2(screen_width(), screen_height());
+        if self.layout.screen.distance_squared(screen) < 1.0 {
+            return;
+        }
+
+        self.layout = Layout::new(screen);
+        self.stars = make_stars(screen);
+        for (index, base) in self.bases.iter_mut().enumerate() {
+            base.position = self.layout.base_positions[index];
+        }
+        for (index, city) in self.cities.iter_mut().enumerate() {
+            city.position = self.layout.city_positions[index];
+        }
+        let bounds = self.layout.cursor_bounds();
+        self.cursor.x = self.cursor.x.clamp(bounds.x, bounds.x + bounds.w);
+        self.cursor.y = self.cursor.y.clamp(bounds.y, bounds.y + bounds.h);
     }
 
     fn update_cursor(&mut self, dt: f32) {
@@ -353,7 +699,7 @@ impl Game {
     }
 
     fn handle_fire_input(&mut self) {
-        if self.paused || self.game_over || self.intermission_timer > 0.0 {
+        if self.mode != ScreenState::Playing || self.paused || self.intermission_timer > 0.0 {
             return;
         }
 
@@ -377,7 +723,7 @@ impl Game {
         }
 
         base.ammo -= 1;
-        let speed = if base_index == 1 { 850.0 } else { 700.0 };
+        let speed = if base_index == 1 { 860.0 } else { 710.0 };
         let color = match base_index {
             0 => color_u8!(64, 200, 255, 255),
             1 => color_u8!(120, 255, 210, 255),
@@ -390,6 +736,7 @@ impl Game {
             speed,
             color,
         });
+        self.audio.play_fire();
     }
 
     fn update_player_missiles(&mut self, dt: f32) {
@@ -402,7 +749,7 @@ impl Game {
                 detonations.push(Explosion {
                     position: missile.position,
                     radius: 4.0,
-                    max_radius: PLAYER_MAX_RADIUS,
+                    max_radius: self.config.blast_radius,
                     expand_speed: 180.0,
                     contract_speed: 90.0,
                     expanding: true,
@@ -414,6 +761,9 @@ impl Game {
                 true
             }
         });
+        if !detonations.is_empty() {
+            self.audio.play_explosion();
+        }
         self.explosions.extend(detonations);
     }
 
@@ -424,8 +774,52 @@ impl Game {
         let available_targets = self.available_target_slots();
         let bases = self.bases;
         let cities = self.cities;
+        let player_blasts: Vec<(Vec2, f32)> = self
+            .explosions
+            .iter()
+            .filter(|explosion| matches!(explosion.owner, ExplosionOwner::Player))
+            .map(|explosion| (explosion.position, explosion.radius))
+            .collect();
+        let mut smart_dodge_triggered = false;
 
         self.enemy_missiles.retain_mut(|missile| {
+            if let EnemyKind::SmartBomb {
+                dodges_left,
+                cooldown,
+            } = &mut missile.kind
+            {
+                *cooldown = (*cooldown - dt).max(0.0);
+                if *dodges_left > 0 && *cooldown <= 0.0 {
+                    if let Some((blast_pos, blast_radius)) =
+                        nearest_blast(missile.position, &player_blasts)
+                    {
+                        if missile.position.distance(blast_pos) <= blast_radius + 34.0 {
+                            let course = (missile.target - missile.position).normalize_or_zero();
+                            let mut side = vec2(-course.y, course.x);
+                            if side.length_squared() == 0.0 {
+                                side = vec2(1.0, 0.0);
+                            }
+                            let sign = if side.dot(blast_pos - missile.position) > 0.0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            missile.position += side.normalize() * sign * 42.0;
+                            missile.position.x =
+                                missile.position.x.clamp(28.0, self.layout.screen.x - 28.0);
+                            missile.position.y = missile
+                                .position
+                                .y
+                                .clamp(self.layout.horizon_y, self.layout.ground_y - 86.0);
+                            missile.start = missile.position;
+                            *dodges_left -= 1;
+                            *cooldown = 0.34;
+                            smart_dodge_triggered = true;
+                        }
+                    }
+                }
+            }
+
             let mut should_keep = true;
             let to_target = missile.target - missile.position;
             let step = missile.speed * dt;
@@ -474,6 +868,13 @@ impl Game {
                 true
             }
         });
+
+        if smart_dodge_triggered {
+            self.audio.play_smart_bomb();
+        }
+        if !detonations.is_empty() {
+            self.audio.play_explosion();
+        }
 
         self.enemy_missiles.extend(spawned_children);
         self.explosions.extend(detonations);
@@ -525,10 +926,11 @@ impl Game {
             }
         });
 
-        self.explosions.extend(detonations);
         if score_events > 0 {
             self.award_points(score_events);
+            self.audio.play_explosion();
         }
+        self.explosions.extend(detonations);
     }
 
     fn update_wave_spawning(&mut self, dt: f32) {
@@ -546,7 +948,7 @@ impl Game {
 
     fn spawn_enemy_missile(&mut self) {
         let Some(target_slot) = self.random_target_slot() else {
-            self.game_over = true;
+            self.trigger_game_over();
             return;
         };
 
@@ -555,8 +957,16 @@ impl Game {
             self.layout.horizon_y,
         );
         let target = self.target_position(target_slot);
-        let base_speed = 75.0 + self.wave as f32 * 9.0;
-        let kind = if self.wave >= 3 && gen_range(0.0, 1.0) < 0.22 {
+        let base_speed =
+            (74.0 + self.wave as f32 * 9.0) * self.config.difficulty.enemy_speed_factor();
+        let smart_bombs_allowed = self.wave >= self.config.difficulty.smart_bomb_start_wave();
+        let roll = gen_range(0.0, 1.0);
+        let kind = if smart_bombs_allowed && roll < self.config.difficulty.smart_bomb_chance() {
+            EnemyKind::SmartBomb {
+                dodges_left: 3,
+                cooldown: 0.0,
+            }
+        } else if self.wave >= 3 && roll < 0.22 + self.config.difficulty.smart_bomb_chance() * 0.4 {
             EnemyKind::Splitter {
                 split_progress: gen_range(0.33, 0.68),
             }
@@ -567,6 +977,7 @@ impl Game {
         let color = match kind {
             EnemyKind::Basic => color_u8!(255, 94, 80, 255),
             EnemyKind::Splitter { .. } => color_u8!(255, 64, 200, 255),
+            EnemyKind::SmartBomb { .. } => color_u8!(255, 255, 110, 255),
         };
 
         self.enemy_missiles.push(EnemyMissile {
@@ -581,7 +992,8 @@ impl Game {
     }
 
     fn next_spawn_interval(&self) -> f32 {
-        (0.95 - self.wave as f32 * 0.03).clamp(0.14, 0.95)
+        let base = (0.96 - self.wave as f32 * 0.03).clamp(0.14, 0.96);
+        (base * self.config.difficulty.spawn_factor()).clamp(0.1, 1.2)
     }
 
     fn random_target_slot(&self) -> Option<TargetSlot> {
@@ -633,10 +1045,16 @@ impl Game {
         }
 
         if self.living_city_count() == 0 {
-            self.game_over = true;
-            self.player_missiles.clear();
-            self.enemy_missiles.clear();
+            self.trigger_game_over();
         }
+    }
+
+    fn trigger_game_over(&mut self) {
+        self.mode = ScreenState::GameOver;
+        self.paused = false;
+        self.player_missiles.clear();
+        self.enemy_missiles.clear();
+        self.audio.play_game_over();
     }
 
     fn living_city_count(&self) -> usize {
@@ -659,6 +1077,266 @@ impl Game {
         ((self.wave.saturating_sub(1)) / 2 + 1).min(6)
     }
 
+    fn draw_title_screen(&self) {
+        draw_centered_text(
+            "MISSILE COMMAND",
+            self.layout.screen * 0.5 + vec2(0.0, -180.0),
+            74,
+            color_u8!(248, 210, 130, 255),
+        );
+        draw_centered_text(
+            "Rust / macroquad prototype",
+            self.layout.screen * 0.5 + vec2(0.0, -132.0),
+            24,
+            color_u8!(200, 220, 236, 255),
+        );
+
+        draw_panel(Rect::new(
+            self.layout.screen.x * 0.29,
+            self.layout.screen.y * 0.34,
+            self.layout.screen.x * 0.42,
+            self.layout.screen.y * 0.28,
+        ));
+
+        draw_centered_text(
+            "ENTER / SPACE  START DEFENSE",
+            self.layout.screen * 0.5 + vec2(0.0, -20.0),
+            30,
+            color_u8!(142, 255, 180, 255),
+        );
+        draw_centered_text(
+            "O / S  SETTINGS    Q  QUIT",
+            self.layout.screen * 0.5 + vec2(0.0, 18.0),
+            24,
+            color_u8!(236, 242, 248, 255),
+        );
+        draw_centered_text(
+            &format!(
+                "AMMO {}   BLAST {:.0}px   DIFFICULTY {}",
+                self.config.ammo_per_base,
+                self.config.blast_radius,
+                self.config.difficulty.label()
+            ),
+            self.layout.screen * 0.5 + vec2(0.0, 72.0),
+            24,
+            color_u8!(164, 210, 255, 255),
+        );
+        draw_centered_text(
+            self.config.difficulty.description(),
+            self.layout.screen * 0.5 + vec2(0.0, 108.0),
+            20,
+            color_u8!(196, 206, 214, 255),
+        );
+    }
+
+    fn draw_settings_screen(&self) {
+        draw_centered_text(
+            "SETTINGS",
+            self.layout.screen * 0.5 + vec2(0.0, -200.0),
+            64,
+            color_u8!(248, 210, 130, 255),
+        );
+
+        let panel = Rect::new(
+            self.layout.screen.x * 0.24,
+            self.layout.screen.y * 0.26,
+            self.layout.screen.x * 0.52,
+            self.layout.screen.y * 0.44,
+        );
+        draw_panel(panel);
+
+        let entries = [
+            format!("BASE MISSILES      {:>2}", self.config.ammo_per_base),
+            format!("BLAST RADIUS       {:>2.0}px", self.config.blast_radius),
+            format!("DIFFICULTY         {}", self.config.difficulty.label()),
+            "BACK".to_owned(),
+        ];
+
+        for (index, entry) in entries.iter().enumerate() {
+            let y = panel.y + 74.0 + index as f32 * 58.0;
+            let selected = index == self.settings_cursor;
+            if selected {
+                draw_rectangle(
+                    panel.x + 34.0,
+                    y - 28.0,
+                    panel.w - 68.0,
+                    40.0,
+                    Color::new(0.12, 0.22, 0.30, 0.85),
+                );
+            }
+            draw_text_ex(
+                entry,
+                panel.x + 62.0,
+                y,
+                TextParams {
+                    font_size: 28,
+                    color: if selected {
+                        color_u8!(142, 255, 180, 255)
+                    } else {
+                        color_u8!(232, 238, 246, 255)
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+
+        draw_text_ex(
+            self.config.difficulty.description(),
+            panel.x + 62.0,
+            panel.y + panel.h - 82.0,
+            TextParams {
+                font_size: 22,
+                color: color_u8!(166, 220, 255, 255),
+                ..Default::default()
+            },
+        );
+        draw_text_ex(
+            "UP/DOWN: select   LEFT/RIGHT: adjust   R: defaults   ESC/ENTER: back",
+            panel.x + 62.0,
+            panel.y + panel.h - 34.0,
+            TextParams {
+                font_size: 20,
+                color: color_u8!(196, 204, 212, 255),
+                ..Default::default()
+            },
+        );
+    }
+
+    fn draw_hud(&self) {
+        let top = 34.0;
+        let left = 32.0;
+        let right = self.layout.screen.x - 430.0;
+        let hud_color = color_u8!(232, 238, 245, 255);
+        let accent = color_u8!(142, 255, 180, 255);
+
+        draw_text_ex(
+            &format!("SCORE {:06}", self.score),
+            left,
+            top,
+            TextParams {
+                font_size: 34,
+                color: hud_color,
+                ..Default::default()
+            },
+        );
+        draw_text_ex(
+            &format!("WAVE {}  x{}", self.wave, self.score_multiplier()),
+            right,
+            top,
+            TextParams {
+                font_size: 30,
+                color: accent,
+                ..Default::default()
+            },
+        );
+        draw_text_ex(
+            &format!("CITIES {}", self.living_city_count()),
+            left,
+            top + 32.0,
+            TextParams {
+                font_size: 22,
+                color: color_u8!(166, 220, 255, 255),
+                ..Default::default()
+            },
+        );
+        draw_text_ex(
+            &format!(
+                "AMMO {}  BLAST {:.0}px  {}",
+                self.config.ammo_per_base,
+                self.config.blast_radius,
+                self.config.difficulty.label()
+            ),
+            right,
+            top + 30.0,
+            TextParams {
+                font_size: 20,
+                color: color_u8!(220, 220, 196, 255),
+                ..Default::default()
+            },
+        );
+        draw_text_ex(
+            "MOVE: ARROWS / MOUSE   FIRE: Z X C   PAUSE: SPACE/P   QUIT: Q",
+            left,
+            self.layout.screen.y - 18.0,
+            TextParams {
+                font_size: 20,
+                color: color_u8!(190, 198, 206, 255),
+                ..Default::default()
+            },
+        );
+    }
+
+    fn draw_play_overlay(&self) {
+        if self.wave_banner_timer > 0.0 {
+            let alpha = (self.wave_banner_timer / 1.75).clamp(0.0, 1.0);
+            draw_centered_text(
+                &format!("WAVE {}", self.wave),
+                self.layout.screen * 0.5 + vec2(0.0, -46.0),
+                56,
+                Color::new(0.96, 0.98, 1.0, alpha),
+            );
+        }
+
+        if self.intermission_timer > 0.0 {
+            draw_centered_text(
+                "SECTOR SECURED",
+                self.layout.screen * 0.5 + vec2(0.0, -8.0),
+                36,
+                color_u8!(142, 255, 180, 255),
+            );
+            draw_centered_text(
+                "MISSILES AND CITIES TALLIED",
+                self.layout.screen * 0.5 + vec2(0.0, 26.0),
+                24,
+                color_u8!(220, 228, 236, 255),
+            );
+        }
+
+        if self.paused {
+            draw_rectangle(
+                0.0,
+                0.0,
+                self.layout.screen.x,
+                self.layout.screen.y,
+                Color::new(0.0, 0.0, 0.0, 0.28),
+            );
+            draw_centered_text(
+                "PAUSED",
+                self.layout.screen * 0.5 + vec2(0.0, -14.0),
+                48,
+                color_u8!(255, 240, 180, 255),
+            );
+        }
+    }
+
+    fn draw_game_over_screen(&self) {
+        draw_rectangle(
+            0.0,
+            0.0,
+            self.layout.screen.x,
+            self.layout.screen.y,
+            Color::new(0.0, 0.0, 0.0, 0.34),
+        );
+        draw_centered_text(
+            "GAME OVER",
+            self.layout.screen * 0.5 + vec2(0.0, -48.0),
+            62,
+            color_u8!(255, 96, 88, 255),
+        );
+        draw_centered_text(
+            &format!("FINAL SCORE {:06}   WAVE {}", self.score, self.wave),
+            self.layout.screen * 0.5 + vec2(0.0, 2.0),
+            28,
+            color_u8!(240, 228, 220, 255),
+        );
+        draw_centered_text(
+            "ENTER/R RESTART   T TITLE   O/S SETTINGS   Q QUIT",
+            self.layout.screen * 0.5 + vec2(0.0, 42.0),
+            22,
+            color_u8!(220, 228, 236, 255),
+        );
+    }
+
     fn draw_stars(&self) {
         for star in &self.stars {
             draw_circle(
@@ -677,10 +1355,14 @@ impl Game {
                 missile.start.y,
                 missile.position.x,
                 missile.position.y,
-                2.0,
+                if matches!(missile.kind, EnemyKind::SmartBomb { .. }) {
+                    3.2
+                } else {
+                    2.0
+                },
                 missile.color,
             );
-            draw_circle(missile.position.x, missile.position.y, 3.5, WHITE);
+            draw_circle(missile.position.x, missile.position.y, 3.6, WHITE);
         }
     }
 
@@ -799,133 +1481,6 @@ impl Game {
         draw_line(x, y - 20.0, x, y - 5.0, 1.8, color);
         draw_line(x, y + 5.0, x, y + 20.0, 1.8, color);
     }
-
-    fn draw_hud(&self) {
-        let top = 34.0;
-        let left = 32.0;
-        let right = self.layout.screen.x - 420.0;
-        let hud_color = color_u8!(232, 238, 245, 255);
-        let accent = color_u8!(142, 255, 180, 255);
-
-        draw_text_ex(
-            &format!("SCORE {:06}", self.score),
-            left,
-            top,
-            TextParams {
-                font_size: 34,
-                color: hud_color,
-                ..Default::default()
-            },
-        );
-        draw_text_ex(
-            &format!("WAVE {}  x{}", self.wave, self.score_multiplier()),
-            right,
-            top,
-            TextParams {
-                font_size: 30,
-                color: accent,
-                ..Default::default()
-            },
-        );
-        draw_text_ex(
-            &format!("CITIES {}", self.living_city_count()),
-            left,
-            top + 32.0,
-            TextParams {
-                font_size: 22,
-                color: color_u8!(166, 220, 255, 255),
-                ..Default::default()
-            },
-        );
-        draw_text_ex(
-            "MOVE: ARROWS / MOUSE   FIRE: Z X C   PAUSE: SPACE/P   QUIT: Q",
-            left,
-            self.layout.screen.y - 18.0,
-            TextParams {
-                font_size: 20,
-                color: color_u8!(190, 198, 206, 255),
-                ..Default::default()
-            },
-        );
-    }
-
-    fn draw_overlay(&self) {
-        if self.wave_banner_timer > 0.0 {
-            let alpha = (self.wave_banner_timer / 1.75).clamp(0.0, 1.0);
-            let text = format!("WAVE {}", self.wave);
-            draw_centered_text(
-                &text,
-                self.layout.screen * 0.5 + vec2(0.0, -40.0),
-                54,
-                Color::new(0.96, 0.98, 1.0, alpha),
-            );
-        }
-
-        if self.intermission_timer > 0.0 {
-            draw_centered_text(
-                "SECTOR SECURED",
-                self.layout.screen * 0.5 + vec2(0.0, -8.0),
-                36,
-                color_u8!(142, 255, 180, 255),
-            );
-            draw_centered_text(
-                "MISSILES AND CITIES TALLIED",
-                self.layout.screen * 0.5 + vec2(0.0, 26.0),
-                24,
-                color_u8!(220, 228, 236, 255),
-            );
-        }
-
-        if self.paused {
-            draw_rectangle(
-                0.0,
-                0.0,
-                self.layout.screen.x,
-                self.layout.screen.y,
-                Color::new(0.0, 0.0, 0.0, 0.28),
-            );
-            draw_centered_text(
-                "PAUSED",
-                self.layout.screen * 0.5 + vec2(0.0, -12.0),
-                48,
-                color_u8!(255, 240, 180, 255),
-            );
-        }
-
-        if self.game_over {
-            draw_rectangle(
-                0.0,
-                0.0,
-                self.layout.screen.x,
-                self.layout.screen.y,
-                Color::new(0.0, 0.0, 0.0, 0.34),
-            );
-            draw_centered_text(
-                "GAME OVER",
-                self.layout.screen * 0.5 + vec2(0.0, -24.0),
-                62,
-                color_u8!(255, 96, 88, 255),
-            );
-            draw_centered_text(
-                "ALL CITIES LOST  |  PRESS Q TO EXIT",
-                self.layout.screen * 0.5 + vec2(0.0, 22.0),
-                24,
-                color_u8!(240, 228, 220, 255),
-            );
-        }
-    }
-}
-
-fn make_stars(screen: Vec2) -> Vec<Star> {
-    let mut stars = Vec::new();
-    for _ in 0..56 {
-        stars.push(Star {
-            position: vec2(gen_range(0.0, screen.x), gen_range(0.0, screen.y * 0.64)),
-            radius: gen_range(0.8, 2.2),
-            alpha: gen_range(0.2, 0.9),
-        });
-    }
-    stars
 }
 
 fn draw_sky(layout: Layout) {
@@ -964,13 +1519,22 @@ fn draw_ground(layout: Layout) {
     );
 }
 
-fn blend(a: Color, b: Color, t: f32) -> Color {
-    Color::new(
-        a.r + (b.r - a.r) * t,
-        a.g + (b.g - a.g) * t,
-        a.b + (b.b - a.b) * t,
-        1.0,
-    )
+fn draw_panel(rect: Rect) {
+    draw_rectangle(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        Color::new(0.03, 0.06, 0.12, 0.78),
+    );
+    draw_rectangle_lines(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        2.0,
+        color_u8!(142, 255, 180, 180),
+    );
 }
 
 fn draw_centered_text(text: &str, center: Vec2, font_size: u16, color: Color) {
@@ -987,6 +1551,27 @@ fn draw_centered_text(text: &str, center: Vec2, font_size: u16, color: Color) {
     );
 }
 
+fn make_stars(screen: Vec2) -> Vec<Star> {
+    let mut stars = Vec::new();
+    for _ in 0..56 {
+        stars.push(Star {
+            position: vec2(gen_range(0.0, screen.x), gen_range(0.0, screen.y * 0.64)),
+            radius: gen_range(0.8, 2.2),
+            alpha: gen_range(0.2, 0.9),
+        });
+    }
+    stars
+}
+
+fn blend(a: Color, b: Color, t: f32) -> Color {
+    Color::new(
+        a.r + (b.r - a.r) * t,
+        a.g + (b.g - a.g) * t,
+        a.b + (b.b - a.b) * t,
+        1.0,
+    )
+}
+
 fn pick_random_slot(slots: &[TargetSlot]) -> Option<TargetSlot> {
     if slots.is_empty() {
         None
@@ -1000,4 +1585,183 @@ fn slot_position(slot: TargetSlot, bases: &[Base; 3], cities: &[City; 6]) -> Vec
         SiteKind::Base => bases[slot.index].position,
         SiteKind::City => cities[slot.index].position,
     }
+}
+
+fn nearest_blast(position: Vec2, blasts: &[(Vec2, f32)]) -> Option<(Vec2, f32)> {
+    blasts
+        .iter()
+        .min_by(|a, b| {
+            position
+                .distance_squared(a.0)
+                .partial_cmp(&position.distance_squared(b.0))
+                .unwrap_or(core::cmp::Ordering::Equal)
+        })
+        .copied()
+}
+
+enum Waveform {
+    Sine,
+    Pulse(f32),
+}
+
+fn make_tone_wav(freq: f32, seconds: f32, volume: f32, waveform: Waveform) -> Vec<u8> {
+    let sample_rate = 22_050;
+    let total = (sample_rate as f32 * seconds) as usize;
+    let mut samples = Vec::with_capacity(total);
+
+    for index in 0..total {
+        let t = index as f32 / sample_rate as f32;
+        let env = (1.0 - index as f32 / total as f32).powf(1.4);
+        let signal = match waveform {
+            Waveform::Sine => (2.0 * PI * freq * t).sin(),
+            Waveform::Pulse(duty) => {
+                let phase = (freq * t).fract();
+                if phase < duty { 1.0 } else { -1.0 }
+            }
+        };
+        samples.push(signal * env * volume);
+    }
+
+    make_pcm_wav(sample_rate, &samples)
+}
+
+fn make_noise_wav(seconds: f32, volume: f32) -> Vec<u8> {
+    let sample_rate = 22_050;
+    let total = (sample_rate as f32 * seconds) as usize;
+    let mut seed = 0x1234_5678u32;
+    let mut samples = Vec::with_capacity(total);
+
+    for index in 0..total {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let noise = ((seed >> 8) as f32 / (u32::MAX >> 8) as f32) * 2.0 - 1.0;
+        let env = (1.0 - index as f32 / total as f32).powf(2.2);
+        samples.push(noise * env * volume);
+    }
+
+    make_pcm_wav(sample_rate, &samples)
+}
+
+fn make_start_wav() -> Vec<u8> {
+    let sample_rate = 22_050;
+    let notes = [(220.0, 0.07), (330.0, 0.07), (440.0, 0.10), (660.0, 0.14)];
+    let mut samples = Vec::new();
+    for (freq, seconds) in notes {
+        samples.extend(make_tone_samples(
+            freq,
+            seconds,
+            0.18,
+            Waveform::Pulse(0.4),
+            sample_rate,
+        ));
+    }
+    make_pcm_wav(sample_rate, &samples)
+}
+
+fn make_game_over_wav() -> Vec<u8> {
+    let sample_rate = 22_050;
+    let notes = [(330.0, 0.08), (248.0, 0.10), (196.0, 0.14), (147.0, 0.18)];
+    let mut samples = Vec::new();
+    for (freq, seconds) in notes {
+        samples.extend(make_tone_samples(
+            freq,
+            seconds,
+            0.17,
+            Waveform::Pulse(0.55),
+            sample_rate,
+        ));
+    }
+    make_pcm_wav(sample_rate, &samples)
+}
+
+fn make_smart_bomb_wav() -> Vec<u8> {
+    let sample_rate = 22_050;
+    let total = (sample_rate as f32 * 0.22) as usize;
+    let mut samples = Vec::with_capacity(total);
+    for index in 0..total {
+        let t = index as f32 / sample_rate as f32;
+        let freq = 300.0 + 900.0 * (index as f32 / total as f32);
+        let env = (1.0 - index as f32 / total as f32).powf(1.1);
+        let value = (2.0 * PI * freq * t).sin();
+        samples.push(value * env * 0.18);
+    }
+    make_pcm_wav(sample_rate, &samples)
+}
+
+fn make_music_wav() -> Vec<u8> {
+    let sample_rate = 22_050;
+    let step_seconds = 0.18;
+    let lead = [220.0, 330.0, 440.0, 330.0, 246.0, 369.0, 493.0, 369.0];
+    let bass = [110.0, 110.0, 123.0, 123.0, 98.0, 98.0, 82.0, 82.0];
+    let total = (sample_rate as f32 * step_seconds * lead.len() as f32) as usize;
+    let mut samples = Vec::with_capacity(total);
+
+    for (step, lead_freq) in lead.iter().enumerate() {
+        let bass_freq = bass[step];
+        let step_samples = (sample_rate as f32 * step_seconds) as usize;
+        for sample in 0..step_samples {
+            let t = sample as f32 / sample_rate as f32;
+            let env = (1.0 - sample as f32 / step_samples as f32).powf(0.7);
+            let lead_value = if (lead_freq * t).fract() < 0.35 {
+                1.0
+            } else {
+                -1.0
+            };
+            let bass_value = (2.0 * PI * bass_freq * t).sin();
+            samples.push((lead_value * 0.10 + bass_value * 0.06) * env);
+        }
+    }
+
+    make_pcm_wav(sample_rate, &samples)
+}
+
+fn make_tone_samples(
+    freq: f32,
+    seconds: f32,
+    volume: f32,
+    waveform: Waveform,
+    sample_rate: u32,
+) -> Vec<f32> {
+    let total = (sample_rate as f32 * seconds) as usize;
+    let mut samples = Vec::with_capacity(total);
+    for index in 0..total {
+        let t = index as f32 / sample_rate as f32;
+        let env = (1.0 - index as f32 / total as f32).powf(1.3);
+        let signal = match waveform {
+            Waveform::Sine => (2.0 * PI * freq * t).sin(),
+            Waveform::Pulse(duty) => {
+                let phase = (freq * t).fract();
+                if phase < duty { 1.0 } else { -1.0 }
+            }
+        };
+        samples.push(signal * env * volume);
+    }
+    samples
+}
+
+fn make_pcm_wav(sample_rate: u32, samples: &[f32]) -> Vec<u8> {
+    let byte_rate = sample_rate * 2;
+    let data_size = (samples.len() * 2) as u32;
+    let riff_size = 36 + data_size;
+    let mut bytes = Vec::with_capacity(44 + samples.len() * 2);
+
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&riff_size.to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(b"fmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&byte_rate.to_le_bytes());
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.extend_from_slice(&16u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_size.to_le_bytes());
+
+    for sample in samples {
+        let clamped = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        bytes.extend_from_slice(&clamped.to_le_bytes());
+    }
+
+    bytes
 }
